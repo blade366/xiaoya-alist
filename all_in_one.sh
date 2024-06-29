@@ -23,7 +23,7 @@ export PATH
 #
 # ——————————————————————————————————————————————————————————————————————————————————
 #
-DATE_VERSION="v1.6.6-2024_06_22_17_34"
+DATE_VERSION="v1.6.7-2024_06_28_20_14"
 #
 # ——————————————————————————————————————————————————————————————————————————————————
 
@@ -315,7 +315,34 @@ function show_disk_mount() {
 function judgment_container() {
 
     if docker container inspect "${1}" > /dev/null 2>&1; then
-        echo -e "${Green}已安装${Font}"
+        local container_status
+        container_status=$(docker inspect --format='{{.State.Status}}' "${1}")
+        case "${container_status}" in
+        "created")
+            echo -e "${Blue}已创建${Font}"
+            ;;
+        "running")
+            echo -e "${Green}运行中${Font}"
+            ;;
+        "paused")
+            echo -e "${Blue}已暂停${Font}"
+            ;;
+        "restarting")
+            echo -e "${Blue}重启中${Font}"
+            ;;
+        "removing")
+            echo -e "${Blue}删除中${Font}"
+            ;;
+        "exited")
+            echo -e "${Yellow}已停止${Font}"
+            ;;
+        "dead")
+            echo -e "${Red}不可用${Font}"
+            ;;
+        *)
+            echo -e "${Red}未知状态${Font}"
+            ;;
+        esac
     else
         echo -e "${Red}未安装${Font}"
     fi
@@ -381,35 +408,72 @@ function docker_pull() {
 
 function container_update() {
 
-    if ! docker inspect containrrr/watchtower:latest > /dev/null 2>&1; then
-        if docker_pull "containrrr/watchtower:latest"; then
-            REMOVE_WATCHTOWER_IMAGE=true
+    local run_image remove_image IMAGE_MIRROR pull_image
+    if docker inspect assaflavie/runlike:latest > /dev/null 2>&1; then
+        local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' assaflavie/runlike:latest | cut -f2 -d:)
+        remote_sha=$(curl -s "https://hub.docker.com/v2/repositories/assaflavie/runlike/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
+        if [ "$local_sha" != "$remote_sha" ]; then
+            docker rmi assaflavie/runlike:latest
+            docker_pull "assaflavie/runlike:latest"
+        fi
+    else
+        docker_pull "assaflavie/runlike:latest"
+    fi
+    INFO "获取 ${1} 容器信息中..."
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v /tmp:/tmp assaflavie/runlike "${@}" > "/tmp/container_update_${*}"
+    run_image=$(docker container inspect -f '{{.Config.Image}}' "${@}")
+    remove_image=$(docker images -q ${run_image})
+    local retries=0
+    local max_retries=3
+    IMAGE_MIRROR=$(cat "${DDSREM_CONFIG_DIR}/image_mirror.txt")
+    while [ $retries -lt $max_retries ]; do
+        if docker pull "${IMAGE_MIRROR}/${run_image}"; then
+            INFO "${1} 镜像拉取成功！"
+            break
+        else
+            WARN "${1} 镜像拉取失败，正在进行第 $((retries + 1)) 次重试..."
+            retries=$((retries + 1))
+        fi
+    done
+    if [ $retries -eq $max_retries ]; then
+        ERROR "镜像拉取失败，已达到最大重试次数！"
+        return 1
+    else
+        if [ "${IMAGE_MIRROR}" != "docker.io" ]; then
+            pull_image=$(docker images -q "${IMAGE_MIRROR}/${run_image}")
+        else
+            pull_image=$(docker images -q "${run_image}")
+        fi
+        if ! docker stop "${@}" > /dev/null 2>&1; then
+            if ! docker kill "${@}" > /dev/null 2>&1; then
+                docker rmi "${IMAGE_MIRROR}/${run_image}"
+                ERROR "更新失败，停止 ${*} 容器失败！"
+                return 1
+            fi
+        fi
+        INFO "停止 ${*} 容器成功！"
+        if ! docker rm --force "${@}" > /dev/null 2>&1; then
+            ERROR "更新失败，删除 ${*} 容器失败！"
+            return 1
+        fi
+        INFO "删除 ${*} 容器成功！"
+        if [ "${pull_image}" != "${remove_image}" ]; then
+            INFO "删除 ${remove_image} 镜像中..."
+            docker rmi "${remove_image}" > /dev/null 2>&1
+        fi
+        if [ "${IMAGE_MIRROR}" != "docker.io" ]; then
+            docker tag "${IMAGE_MIRROR}/${1}" "${1}" > /dev/null 2>&1
+            docker rmi "${IMAGE_MIRROR}/${1}" > /dev/null 2>&1
+        fi
+        if bash "/tmp/container_update_${*}"; then
+            rm -f "/tmp/container_update_${*}"
+            INFO "${*} 更新成功"
+            return 0
+        else
+            ERROR "更新失败，创建 ${*} 容器失败！"
+            return 1
         fi
     fi
-
-    CURRENT_WATCHTOWER=$(docker ps --format '{{.Names}}' --filter ancestor=containrrr/watchtower | sed ':a;N;$!ba;s/\n/ /g')
-
-    if [ -n "${CURRENT_WATCHTOWER}" ]; then
-        docker stop "${CURRENT_WATCHTOWER}"
-    fi
-
-    docker run --rm \
-        -v /var/run/docker.sock:/var/run/docker.sock \
-        -e TZ=Asia/Shanghai \
-        containrrr/watchtower:latest \
-        --run-once \
-        --cleanup \
-        "${@}"
-
-    if [ "${REMOVE_WATCHTOWER_IMAGE}" == "true" ]; then
-        docker rmi containrrr/watchtower:latest
-    fi
-
-    if [ -n "${CURRENT_WATCHTOWER}" ]; then
-        docker start "${CURRENT_WATCHTOWER}"
-    fi
-
-    INFO "${*} 更新成功"
 
 }
 
@@ -526,6 +590,7 @@ function get_config_dir() {
         echo "${CONFIG_DIR}" > ${DDSREM_CONFIG_DIR}/xiaoya_alist_config_dir.txt
     fi
     if [ -d "${CONFIG_DIR}" ]; then
+        INFO "读取配置目录中..."
         # 将所有小雅配置文件修正成 linux 格式
         find ${CONFIG_DIR} -type f -name "*.txt" -exec sed -i "s/\r$//g" {} \;
         # 设置权限
@@ -786,108 +851,6 @@ function judgment_xiaoya_alist_sync_data_status() {
 
 }
 
-function install_xiaoya_alist_sync_data() {
-
-    if [ ! -f ${DDSREM_CONFIG_DIR}/xiaoya_alist_config_dir.txt ]; then
-        get_config_dir
-    else
-        CONFIG_DIR="$(cat ${DDSREM_CONFIG_DIR}/xiaoya_alist_config_dir.txt)"
-    fi
-
-    while true; do
-        INFO "请输入您希望的同步间隔"
-        read -erp "请输入以小时为单位的同步间隔时间（默认：5）：" sync_interval
-        [[ -z "${sync_interval}" ]] && sync_interval="5"
-        if [[ "$sync_interval" -gt 0 && "$sync_interval" -le 23 ]]; then
-            break
-        else
-            ERROR "输入错误，请重新输入。同步间隔时间必须为1到23之间的正整数。"
-        fi
-    done
-
-    bash -c "$(curl --insecure -fsSL https://ddsrem.com/xiaoya/xiaoya_data_downloader.sh)" -s "${CONFIG_DIR}"
-
-    # 组合定时任务命令
-    CRON="0 */${sync_interval} * * *   bash -c \"\$(curl --insecure -fsSL https://ddsrem.com/xiaoya/xiaoya_data_downloader.sh)\" -s \
-${CONFIG_DIR} >> \
-${CONFIG_DIR}/data/cron.log 2>&1"
-    if command -v crontab > /dev/null 2>&1; then
-        crontab -l | grep -v xiaoya_data_downloader > /tmp/cronjob.tmp
-        echo -e "${CRON}" >> /tmp/cronjob.tmp
-        crontab /tmp/cronjob.tmp
-        INFO '已经添加下面的记录到crontab定时任务'
-        INFO "${CRON}"
-        rm -rf /tmp/cronjob.tmp
-    elif [ -f /etc/synoinfo.conf ]; then
-        # 群晖单独支持
-        cp /etc/crontab /etc/crontab.bak
-        INFO "已创建/etc/crontab.bak备份文件"
-        sed -i '/xiaoya_data_downloader/d' /etc/crontab
-        echo -e "${CRON}" >> /etc/crontab
-        INFO '已经添加下面的记录到crontab定时任务'
-        INFO "${CRON}"
-    fi
-
-    local net_mode
-    net_mode="$(docker inspect --format='{{range $m, $conf := .NetworkSettings.Networks}}{{$m}}{{end}}' "$(cat ${DDSREM_CONFIG_DIR}/container_name/xiaoya_alist_name.txt)")"
-    if [ "$net_mode"x = "bridge"x ]; then
-        echo "http://127.0.0.1:81/data" > "${CONFIG_DIR}"/download_url.txt
-    elif [ "$net_mode"x = "host"x ]; then
-        echo "http://127.0.0.1:5233/data" > "${CONFIG_DIR}"/download_url.txt
-    else
-        WARN "程序自动编辑download_url.txt失败，请自行编辑 ${CONFIG_DIR}/download_url.txt 文件！"
-    fi
-
-    if docker inspect xiaoyaliu/alist:latest > /dev/null 2>&1; then
-        if docker inspect xiaoyaliu/alist:latest > /dev/null 2>&1; then
-            local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' xiaoyaliu/alist:latest | cut -f2 -d:)
-            remote_sha=$(curl -s "https://hub.docker.com/v2/repositories/xiaoyaliu/alist/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
-            INFO "remote_sha: ${remote_sha}"
-            INFO "local_sha: ${local_sha}"
-            if [ ! "${local_sha}" == "${remote_sha}" ] && [ -n "${remote_sha}" ] && [ -n "${local_sha}" ]; then
-                INFO "程序将更新小雅容器！"
-                IMAGE_NAME="$(docker inspect --format='{{.Config.Image}}' "$(cat ${DDSREM_CONFIG_DIR}/container_name/xiaoya_alist_name.txt)")"
-                docker stop "$(cat ${DDSREM_CONFIG_DIR}/container_name/xiaoya_alist_name.txt)"
-                docker rm "$(cat ${DDSREM_CONFIG_DIR}/container_name/xiaoya_alist_name.txt)"
-                docker rmi "${IMAGE_NAME}"
-                SET_NET_MODE=false
-                NET_MODE=n
-                install_xiaoya_alist
-            else
-                INFO "跳过小雅容器更新"
-                INFO "重启小雅容器使配置生效！"
-                docker restart "$(cat ${DDSREM_CONFIG_DIR}/container_name/xiaoya_alist_name.txt)"
-                wait_xiaoya_start
-            fi
-        fi
-    elif docker inspect xiaoyaliu/alist:hostmode > /dev/null 2>&1; then
-        if docker inspect xiaoyaliu/alist:hostmode > /dev/null 2>&1; then
-            local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' xiaoyaliu/alist:hostmode | cut -f2 -d:)
-            remote_sha=$(curl -s "https://hub.docker.com/v2/repositories/xiaoyaliu/alist/tags/hostmode" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
-            INFO "remote_sha: ${remote_sha}"
-            INFO "local_sha: ${local_sha}"
-            if [ ! "${local_sha}" == "${remote_sha}" ] && [ -n "${remote_sha}" ] && [ -n "${local_sha}" ]; then
-                INFO "程序将更新小雅容器！"
-                IMAGE_NAME="$(docker inspect --format='{{.Config.Image}}' "$(cat ${DDSREM_CONFIG_DIR}/container_name/xiaoya_alist_name.txt)")"
-                docker stop "$(cat ${DDSREM_CONFIG_DIR}/container_name/xiaoya_alist_name.txt)"
-                docker rm "$(cat ${DDSREM_CONFIG_DIR}/container_name/xiaoya_alist_name.txt)"
-                docker rmi "${IMAGE_NAME}"
-                SET_NET_MODE=false
-                NET_MODE=y
-                install_xiaoya_alist
-            else
-                INFO "跳过小雅容器更新"
-                INFO "重启小雅容器使配置生效！"
-                docker restart "$(cat ${DDSREM_CONFIG_DIR}/container_name/xiaoya_alist_name.txt)"
-                wait_xiaoya_start
-            fi
-        fi
-    fi
-
-    INFO "设置完成！"
-
-}
-
 function uninstall_xiaoya_alist_sync_data() {
 
     if command -v crontab > /dev/null 2>&1; then
@@ -908,7 +871,7 @@ function main_xiaoya_alist() {
     echo -e "1、安装"
     echo -e "2、更新"
     echo -e "3、卸载"
-    echo -e "4、创建/删除 定时同步更新数据                  当前状态：$(judgment_xiaoya_alist_sync_data_status)"
+    echo -e "4、创建/删除 定时同步更新数据（${Red}功能已弃用，只提供删除${Font}）  当前状态：$(judgment_xiaoya_alist_sync_data_status)"
     echo -e "0、返回上级"
     echo -e "——————————————————————————————————————————————————————————————————————————————————"
     read -erp "请输入数字 [0-4]:" num
@@ -942,7 +905,7 @@ function main_xiaoya_alist() {
                 clear
                 INFO "已删除"
             else
-                install_xiaoya_alist_sync_data
+                INFO "功能已弃用，目前只提供删除！"
             fi
         elif [ -f /etc/synoinfo.conf ]; then
             if grep 'xiaoya_data_downloader' /etc/crontab > /dev/null 2>&1; then
@@ -954,12 +917,10 @@ function main_xiaoya_alist() {
                 clear
                 INFO "已删除"
             else
-                install_xiaoya_alist_sync_data
+                INFO "功能已弃用，目前只提供删除！"
             fi
         else
-            WARN "目前你的系统不支持脚本自动设置定时任务，请手动将以下命令添加到定时任务，并修改 xiaoya配置文件目录 ！"
-            WARN "bash -c \"\$(curl --insecure -fsSL https://ddsrem.com/xiaoya/xiaoya_data_downloader.sh)\" -s xiaoya配置文件目录"
-            exit 0
+            INFO "功能已弃用，目前只提供删除！"
         fi
         return_menu "main_xiaoya_alist"
         ;;
@@ -1090,45 +1051,6 @@ function pull_run_glue() {
             -e LANG=C.UTF-8 \
             -e TZ=Asia/Shanghai \
             xiaoyaliu/glue:latest \
-            "${@}"
-    fi
-
-}
-
-function pull_run_ddsderek_glue() {
-
-    if docker inspect ddsderek/xiaoya-glue:latest > /dev/null 2>&1; then
-        local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' ddsderek/xiaoya-glue:latest | cut -f2 -d:)
-        remote_sha=$(curl -s "https://hub.docker.com/v2/repositories/ddsderek/xiaoya-glue/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
-        if [ "$local_sha" != "$remote_sha" ]; then
-            docker rmi ddsderek/xiaoya-glue:latest
-        fi
-    fi
-
-    docker_pull "ddsderek/xiaoya-glue:latest"
-
-    if [ -n "${extra_parameters}" ]; then
-        docker run -it \
-            --security-opt seccomp=unconfined \
-            --rm \
-            --net=host \
-            -v "${MEDIA_DIR}:/media" \
-            -v "${CONFIG_DIR}:/etc/xiaoya" \
-            ${extra_parameters} \
-            -e LANG=C.UTF-8 \
-            -e TZ=Asia/Shanghai \
-            ddsderek/xiaoya-glue:latest \
-            "${@}"
-    else
-        docker run -it \
-            --security-opt seccomp=unconfined \
-            --rm \
-            --net=host \
-            -v "${MEDIA_DIR}:/media" \
-            -v "${CONFIG_DIR}:/etc/xiaoya" \
-            -e LANG=C.UTF-8 \
-            -e TZ=Asia/Shanghai \
-            ddsderek/xiaoya-glue:latest \
             "${@}"
     fi
 
@@ -2775,18 +2697,6 @@ function install_jellyfin_xiaoya_all_jellyfin() {
 
 }
 
-function docker_address_xiaoya_all_emby() {
-
-    get_config_dir
-
-    get_media_dir
-
-    pull_run_ddsderek_glue "/docker_address.sh"
-
-    INFO "替换DOCKER_ADDRESS完成！"
-
-}
-
 function install_xiaoya_notify_cron() {
 
     if [ ! -f ${DDSREM_CONFIG_DIR}/resilio_config_dir.txt ]; then
@@ -3544,11 +3454,11 @@ function main_xiaoya_all_emby() {
     echo -e "2、下载/解压 元数据"
     echo -e "3、安装Emby（可选择版本）"
     echo -e "4、替换DOCKER_ADDRESS（${Red}已弃用${Font}）"
-    echo -e "5、安装/更新/卸载 Resilio-Sync                当前安装状态：$(judgment_container "${xiaoya_resilio_name}")"
+    echo -e "5、安装/更新/卸载 Resilio-Sync                当前状态：$(judgment_container "${xiaoya_resilio_name}")"
     echo -e "6、立即同步小雅Emby config目录"
     echo -e "7、创建/删除 同步定时更新任务                 当前状态：$(judgment_xiaoya_notify_status)"
     echo -e "8、图形化编辑 emby_config.txt"
-    echo -e "9、安装/更新/卸载 小雅元数据定时爬虫          当前安装状态：$(judgment_container xiaoya-emd)"
+    echo -e "9、安装/更新/卸载 小雅元数据定时爬虫          当前状态：$(judgment_container xiaoya-emd)"
     echo -e "10、卸载Emby全家桶"
     echo -e "0、返回上级"
     echo -e "——————————————————————————————————————————————————————————————————————————————————"
@@ -3588,7 +3498,7 @@ function main_xiaoya_all_emby() {
         ;;
     4)
         clear
-        docker_address_xiaoya_all_emby
+        WARN "此功能已弃用！"
         return_menu "main_xiaoya_all_emby"
         ;;
     5)
@@ -4870,8 +4780,8 @@ function main_other_tools() {
 
     echo -e "——————————————————————————————————————————————————————————————————————————————————"
     echo -e "${Blue}其他工具${Font}\n"
-    echo -e "1、安装/更新/卸载 Portainer                   当前安装状态：$(judgment_container "${portainer_name}")"
-    echo -e "2、安装/更新/卸载 Auto_Symlink                当前安装状态：$(judgment_container "${auto_symlink_name}")"
+    echo -e "1、安装/更新/卸载 Portainer                   当前状态：$(judgment_container "${portainer_name}")"
+    echo -e "2、安装/更新/卸载 Auto_Symlink                当前状态：$(judgment_container "${auto_symlink_name}")"
     echo -e "3、查看系统磁盘挂载"
     echo -e "4、安装/卸载 CasaOS"
     echo -e "0、返回上级"
@@ -4924,12 +4834,12 @@ function main_return() {
             out_tips="${Red}警告：当前环境无法访问Docker镜像仓库，请输入96进入Docker镜像源设置更改镜像源${Font}\n"
         fi
     fi
-    echo -e "${out_tips}1、安装/更新/卸载 小雅Alist                   当前安装状态：$(judgment_container "${xiaoya_alist_name}")
-2、安装/卸载 小雅Emby全家桶                   当前安装状态：$(judgment_container "${xiaoya_emby_name}")
-3、安装/卸载 小雅Jellyfin全家桶               当前安装状态：$(judgment_container "${xiaoya_jellyfin_name}")
-4、安装/更新/卸载 小雅助手（xiaoyahelper）    当前安装状态：$(judgment_container xiaoyakeeper)
-5、安装/更新/卸载 小雅Alist-TVBox             当前安装状态：$(judgment_container "${xiaoya_tvbox_name}")
-6、安装/更新/卸载 Onelist                     当前安装状态：$(judgment_container "${xiaoya_onelist_name}")
+    echo -e "${out_tips}1、安装/更新/卸载 小雅Alist                   当前状态：$(judgment_container "${xiaoya_alist_name}")
+2、安装/卸载 小雅Emby全家桶                   当前状态：$(judgment_container "${xiaoya_emby_name}")
+3、安装/卸载 小雅Jellyfin全家桶               当前状态：$(judgment_container "${xiaoya_jellyfin_name}")
+4、安装/更新/卸载 小雅助手（xiaoyahelper）    当前状态：$(judgment_container xiaoyakeeper)
+5、安装/更新/卸载 小雅Alist-TVBox             当前状态：$(judgment_container "${xiaoya_tvbox_name}")
+6、安装/更新/卸载 Onelist                     当前状态：$(judgment_container "${xiaoya_onelist_name}")
 7、Docker Compose 安装/卸载 小雅及全家桶（实验性功能）
 8、其他工具 | Script info: ${DATE_VERSION} OS: ${_os},${OSNAME},${is64bit}
 9、高级配置 | Docker version: ${Blue}${DOCKER_VERSION}${Font} ${IP_CITY}
