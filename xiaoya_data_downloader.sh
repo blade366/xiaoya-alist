@@ -15,7 +15,7 @@ export PATH
 #
 # Copyright (c) 2024 DDSRem <https://blog.ddsrem.com>
 #
-# This is free software, licensed under the Mit License.
+# This is free software, licensed under the GNU General Public License v3.0.
 #
 # ——————————————————————————————————————————————————————————————————————————————————
 
@@ -31,6 +31,12 @@ function INFO() {
 function ERROR() {
     echo -e "${Time} ${ERROR} ${1}"
 }
+
+# 弃用此脚本
+if [ -n "$(date)" ]; then
+    ERROR "此脚本已弃用！"
+    exit 0
+fi
 
 files=(tvbox.zip update.zip index.zip)
 base_urls=(

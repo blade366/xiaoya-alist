@@ -16,7 +16,7 @@ export PATH
 #
 # Copyright (c) 2024 DDSRem <https://blog.ddsrem.com>
 #
-# This is free software, licensed under the Mit License.
+# This is free software, licensed under the GNU General Public License v3.0.
 #
 # ——————————————————————————————————————————————————————————————————————————————————
 
@@ -40,46 +40,80 @@ function WARN() {
 
 function container_update() {
 
-    if ! docker inspect containrrr/watchtower:latest > /dev/null 2>&1; then
-        if docker pull containrrr/watchtower:latest; then
-            INFO "镜像拉取成功！"
-            REMOVE_WATCHTOWER_IMAGE=true
+    local run_image remove_image IMAGE_MIRROR pull_image
+    if docker inspect ddsderek/runlike:latest > /dev/null 2>&1; then
+        local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' ddsderek/runlike:latest 2> /dev/null | cut -f2 -d:)
+        remote_sha=$(curl -s -m 10 "https://hub.docker.com/v2/repositories/ddsderek/runlike/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
+        if [ "$local_sha" != "$remote_sha" ]; then
+            docker rmi ddsderek/runlike:latest
+            docker_pull "ddsderek/runlike:latest"
+        fi
+    else
+        docker_pull "ddsderek/runlike:latest"
+    fi
+    INFO "获取 ${1} 容器信息中..."
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v /tmp:/tmp ddsderek/runlike "${@}" > "/tmp/container_update_${*}"
+    run_image=$(docker container inspect -f '{{.Config.Image}}' "${@}")
+    remove_image=$(docker images -q ${run_image})
+    local retries=0
+    local max_retries=3
+    IMAGE_MIRROR=$(cat "${DDSREM_CONFIG_DIR}/image_mirror.txt")
+    while [ $retries -lt $max_retries ]; do
+        if docker pull "${IMAGE_MIRROR}/${run_image}"; then
+            INFO "${1} 镜像拉取成功！"
+            break
         else
-            ERROR "镜像拉取失败！"
+            WARN "${1} 镜像拉取失败，正在进行第 $((retries + 1)) 次重试..."
+            retries=$((retries + 1))
+        fi
+    done
+    if [ $retries -eq $max_retries ]; then
+        ERROR "镜像拉取失败，已达到最大重试次数！"
+        return 1
+    else
+        if [ "${IMAGE_MIRROR}" != "docker.io" ]; then
+            pull_image=$(docker images -q "${IMAGE_MIRROR}/${run_image}")
+        else
+            pull_image=$(docker images -q "${run_image}")
+        fi
+        if ! docker stop "${@}" > /dev/null 2>&1; then
+            if ! docker kill "${@}" > /dev/null 2>&1; then
+                docker rmi "${IMAGE_MIRROR}/${run_image}"
+                ERROR "更新失败，停止 ${*} 容器失败！"
+                return 1
+            fi
+        fi
+        INFO "停止 ${*} 容器成功！"
+        if ! docker rm --force "${@}" > /dev/null 2>&1; then
+            ERROR "更新失败，删除 ${*} 容器失败！"
+            return 1
+        fi
+        INFO "删除 ${*} 容器成功！"
+        if [ "${pull_image}" != "${remove_image}" ]; then
+            INFO "删除 ${remove_image} 镜像中..."
+            docker rmi "${remove_image}" > /dev/null 2>&1
+        fi
+        if [ "${IMAGE_MIRROR}" != "docker.io" ]; then
+            docker tag "${IMAGE_MIRROR}/${1}" "${1}" > /dev/null 2>&1
+            docker rmi "${IMAGE_MIRROR}/${1}" > /dev/null 2>&1
+        fi
+        if bash "/tmp/container_update_${*}"; then
+            rm -f "/tmp/container_update_${*}"
+            INFO "${*} 更新成功"
+            return 0
+        else
+            ERROR "更新失败，创建 ${*} 容器失败！"
             return 1
         fi
     fi
-
-    CURRENT_WATCHTOWER=$(docker ps --format '{{.Names}}' --filter ancestor=containrrr/watchtower | sed ':a;N;$!ba;s/\n/ /g')
-
-    if [ -n "${CURRENT_WATCHTOWER}" ]; then
-        docker stop "${CURRENT_WATCHTOWER}"
-    fi
-
-    docker run --rm \
-        -v /var/run/docker.sock:/var/run/docker.sock \
-        containrrr/watchtower:latest \
-        --run-once \
-        --cleanup \
-        "${@}"
-
-    if [ "${REMOVE_WATCHTOWER_IMAGE}" == "true" ]; then
-        docker rmi containrrr/watchtower:latest
-    fi
-
-    if [ -n "${CURRENT_WATCHTOWER}" ]; then
-        docker start "${CURRENT_WATCHTOWER}"
-    fi
-
-    INFO "${*} 更新成功"
 
 }
 
 function pull_run_glue() {
 
     if docker inspect xiaoyaliu/glue:latest > /dev/null 2>&1; then
-        local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' xiaoyaliu/glue:latest | cut -f2 -d:)
-        remote_sha=$(curl -s "https://hub.docker.com/v2/repositories/xiaoyaliu/glue/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
+        local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' xiaoyaliu/glue:latest 2> /dev/null | cut -f2 -d:)
+        remote_sha=$(curl -s -m 10 "https://hub.docker.com/v2/repositories/xiaoyaliu/glue/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
         if [ ! "$local_sha" == "$remote_sha" ]; then
             docker rmi xiaoyaliu/glue:latest
             if docker pull xiaoyaliu/glue:latest; then
@@ -128,8 +162,8 @@ function pull_run_glue_xh() {
     BUILDER_NAME="xiaoya_builder_$(date +%S%N | cut -c 7-11)"
 
     if docker inspect xiaoyaliu/glue:latest > /dev/null 2>&1; then
-        local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' xiaoyaliu/glue:latest | cut -f2 -d:)
-        remote_sha=$(curl -s "https://hub.docker.com/v2/repositories/xiaoyaliu/glue/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
+        local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' xiaoyaliu/glue:latest 2> /dev/null | cut -f2 -d:)
+        remote_sha=$(curl -s -m 10 "https://hub.docker.com/v2/repositories/xiaoyaliu/glue/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
         if [ ! "$local_sha" == "$remote_sha" ]; then
             docker rmi xiaoyaliu/glue:latest
             if docker pull xiaoyaliu/glue:latest; then
@@ -213,14 +247,14 @@ function test_xiaoya_status() {
     get_docker0_url
 
     INFO "测试xiaoya的联通性..."
-    if curl -siL http://127.0.0.1:5678/d/README.md | grep -v 302 | grep "x-oss-" > /dev/null 2>&1; then
+    if curl -siL -m 10 http://127.0.0.1:5678/d/README.md | grep -v 302 | grep -e "x-oss-" -e "x-115-request-id" > /dev/null 2>&1; then
         xiaoya_addr="http://127.0.0.1:5678"
-    elif curl -siL http://${docker0}:5678/d/README.md | grep -v 302 | grep "x-oss-" > /dev/null 2>&1; then
+    elif curl -siL -m 10 http://${docker0}:5678/d/README.md | grep -v 302 | grep -e "x-oss-" -e "x-115-request-id" > /dev/null 2>&1; then
         xiaoya_addr="http://${docker0}:5678"
     else
         if [ -s ${CONFIG_DIR}/docker_address.txt ]; then
             docker_address=$(head -n1 ${CONFIG_DIR}/docker_address.txt)
-            if curl -siL ${docker_address}/d/README.md | grep -v 302 | grep "x-oss-" > /dev/null 2>&1; then
+            if curl -siL -m 10 ${docker_address}/d/README.md | grep -v 302 | grep -e "x-oss-" -e "x-115-request-id" > /dev/null 2>&1; then
                 xiaoya_addr=${docker_address}
             else
                 ERROR "请检查xiaoya是否正常运行后再试"
@@ -279,8 +313,7 @@ function update_media() {
 
     extra_parameters="--workdir=/media/temp"
 
-    _os_all=$(uname -a)
-    if echo -e "${_os_all}" | grep -Eqi "UGREEN"; then
+    if [ "$OSNAME" = "ugos" ] || [ "$OSNAME" = "ugos pro" ]; then
         INFO "wget 下载模式"
         pull_run_glue wget -c --show-progress "${xiaoya_addr}/d/元数据/${1}"
     else
@@ -406,8 +439,8 @@ function sync_emby_config() {
         xiaoyaliu/glue:latest"
 
     if docker inspect xiaoyaliu/glue:latest > /dev/null 2>&1; then
-        local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' xiaoyaliu/glue:latest | cut -f2 -d:)
-        remote_sha=$(curl -s "https://hub.docker.com/v2/repositories/xiaoyaliu/glue/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
+        local_sha=$(docker inspect --format='{{index .RepoDigests 0}}' xiaoyaliu/glue:latest 2> /dev/null | cut -f2 -d:)
+        remote_sha=$(curl -s -m 10 "https://hub.docker.com/v2/repositories/xiaoyaliu/glue/tags/latest" | grep -o '"digest":"[^"]*' | grep -o '[^"]*$' | tail -n1 | cut -f2 -d:)
         if [ ! "$local_sha" == "$remote_sha" ]; then
             docker rmi xiaoyaliu/glue:latest
             if docker pull xiaoyaliu/glue:latest; then
@@ -468,8 +501,7 @@ function sync_emby_config() {
     test_xiaoya_status
 
     extra_parameters="--workdir=/media/temp"
-    _os_all=$(uname -a)
-    if echo -e "${_os_all}" | grep -Eqi "UGREEN"; then
+    if [ "$OSNAME" = "ugos" ] || [ "$OSNAME" = "ugos pro" ]; then
         INFO "绿联NAS使用 wget 下载"
         pull_run_glue wget -c --show-progress "${xiaoya_addr}/d/元数据/config.mp4"
     else
@@ -699,6 +731,97 @@ EOF
     INFO "Emby 容器名称：${EMBY_NAME}"
     INFO "Resilio 容器名称：${RESILIO_NAME}"
     INFO "小雅容器名称：${XIAOYA_NAME}"
+
+    _os=$(uname -s)
+    _os_all=$(uname -a)
+    if [ "${_os}" == "Darwin" ]; then
+        OSNAME='macos'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+        stty -icanon
+    # 必须先判断的系统
+    # 绿联旧版UGOS 基于 OpenWRT
+    elif [ -f /etc/openwrt_version ] && echo -e "${_os_all}" | grep -Eqi "UGREEN"; then
+        OSNAME='ugos'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    # 绿联UGOS Pro 基于 Debian
+    elif grep -Eqi "Debian" /etc/os-release && grep -Eqi "UGOSPRO" /etc/issue; then
+        OSNAME='ugos pro'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    # OpenMediaVault 基于 Debian
+    elif grep -Eqi "openmediavault" /etc/issue || grep -Eqi "openmediavault" /etc/os-release; then
+        OSNAME='openmediavault'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    # FreeNAS（TrueNAS CORE）基于 FreeBSD
+    elif echo -e "${_os_all}" | grep -Eqi "FreeBSD" | grep -Eqi "TRUENAS"; then
+        OSNAME='truenas core'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    # TrueNAS SCALE 基于 Debian
+    elif grep -Eqi "Debian" /etc/issue && [ -f /etc/version ]; then
+        OSNAME='truenas scale'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif [ -f /etc/synoinfo.conf ]; then
+        OSNAME='synology'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif [ -f /etc/openwrt_release ]; then
+        OSNAME='openwrt'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "QNAP" /etc/issue; then
+        OSNAME='qnap'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif [ -f /etc/unraid-version ]; then
+        OSNAME='unraid'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "LibreELEC" /etc/issue || grep -Eqi "LibreELEC" /etc/*-release; then
+        OSNAME='libreelec'
+        DDSREM_CONFIG_DIR=/storage/DDSRem
+        ERROR "LibreELEC 系统目前不支持！"
+        exit 1
+    elif grep -Eqi "openSUSE" /etc/*-release; then
+        OSNAME='opensuse'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "FreeBSD" /etc/*-release; then
+        OSNAME='freebsd'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "EulerOS" /etc/*-release || grep -Eqi "openEuler" /etc/*-release; then
+        OSNAME='euler'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "CentOS" /etc/issue || grep -Eqi "CentOS" /etc/*-release; then
+        OSNAME='centos'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "Fedora" /etc/issue || grep -Eqi "Fedora" /etc/*-release; then
+        OSNAME='fedora'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "Rocky" /etc/issue || grep -Eqi "Rocky" /etc/*-release; then
+        OSNAME='rocky'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "AlmaLinux" /etc/issue || grep -Eqi "AlmaLinux" /etc/*-release; then
+        OSNAME='almalinux'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "Arch Linux" /etc/issue || grep -Eqi "Arch Linux" /etc/*-release; then
+        OSNAME='archlinux'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "Amazon Linux" /etc/issue || grep -Eqi "Amazon Linux" /etc/*-release; then
+        OSNAME='amazon'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "Debian" /etc/issue || grep -Eqi "Debian" /etc/os-release; then
+        OSNAME='debian'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "Ubuntu" /etc/issue || grep -Eqi "Ubuntu" /etc/os-release; then
+        OSNAME='ubuntu'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    elif grep -Eqi "Alpine" /etc/issue || grep -Eq "Alpine" /etc/*-release; then
+        OSNAME='alpine'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    else
+        OSNAME='unknow'
+        DDSREM_CONFIG_DIR=/etc/DDSRem
+    fi
+
+    INFO "OS: ${_os},${OSNAME}"
+    INFO "脚本配置文件路径：${DDSREM_CONFIG_DIR}"
+    if [ ! -f "${DDSREM_CONFIG_DIR}/image_mirror.txt" ]; then
+        echo 'docker.io' > ${DDSREM_CONFIG_DIR}/image_mirror.txt
+    fi
 
     test_xiaoya_status
 
